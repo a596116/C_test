@@ -1,8 +1,10 @@
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
 using System.Text;
+using LoginApi.Data;
 using LoginApi.Models;
 
 namespace LoginApi.Controllers;
@@ -13,19 +15,112 @@ public class AuthController : ControllerBase
 {
     private readonly IConfiguration _configuration;
     private readonly ILogger<AuthController> _logger;
+    private readonly ApplicationDbContext _context;
 
-    // 簡單的用戶資料庫（實際應用中應該使用真實的資料庫）
-    private readonly Dictionary<string, string> _users = new()
-    {
-        { "admin", "admin123" },
-        { "user", "user123" },
-        { "test", "test123" }
-    };
-
-    public AuthController(IConfiguration configuration, ILogger<AuthController> logger)
+    public AuthController(
+        IConfiguration configuration, 
+        ILogger<AuthController> logger,
+        ApplicationDbContext context)
     {
         _configuration = configuration;
         _logger = logger;
+        _context = context;
+    }
+
+    /// <summary>
+    /// 使用者註冊
+    /// </summary>
+    /// <param name="request">註冊請求，包含使用者名稱、密碼和電子郵件</param>
+    /// <returns>註冊結果</returns>
+    /// <response code="200">註冊成功</response>
+    /// <response code="422">驗證失敗</response>
+    /// <response code="409">使用者名稱或電子郵件已存在</response>
+    /// <response code="500">伺服器內部錯誤</response>
+    [HttpPost("register")]
+    [ProducesResponseType(typeof(ApiResponse<LoginResponse>), StatusCodes.Status200OK)]
+    [ProducesResponseType(typeof(ApiResponse), StatusCodes.Status422UnprocessableEntity)]
+    [ProducesResponseType(typeof(ApiResponse), StatusCodes.Status409Conflict)]
+    [ProducesResponseType(typeof(ApiResponse), StatusCodes.Status500InternalServerError)]
+    public async Task<IActionResult> Register([FromBody] RegisterRequest request)
+    {
+        try
+        {
+            // 模型驗證由 ValidationErrorFilter 自動處理
+
+            // 檢查使用者名稱是否已存在
+            var existingUser = await _context.Users
+                .FirstOrDefaultAsync(u => u.Username == request.Username);
+            
+            if (existingUser != null)
+            {
+                _logger.LogWarning($"註冊失敗：使用者名稱 {request.Username} 已存在");
+                return Conflict(new ApiResponse
+                {
+                    StatusCode = 409,
+                    Success = false,
+                    Message = "使用者名稱已存在"
+                });
+            }
+
+            // 檢查電子郵件是否已存在（如果提供）
+            if (!string.IsNullOrEmpty(request.Email))
+            {
+                var existingEmail = await _context.Users
+                    .FirstOrDefaultAsync(u => u.Email == request.Email);
+                
+                if (existingEmail != null)
+                {
+                    _logger.LogWarning($"註冊失敗：電子郵件 {request.Email} 已存在");
+                    return Conflict(new ApiResponse
+                    {
+                        StatusCode = 409,
+                        Success = false,
+                        Message = "電子郵件已被使用"
+                    });
+                }
+            }
+
+            // 建立新使用者
+            var user = new User
+            {
+                Username = request.Username,
+                PasswordHash = BCrypt.Net.BCrypt.HashPassword(request.Password),
+                Email = request.Email,
+                CreatedAt = DateTime.UtcNow
+            };
+
+            _context.Users.Add(user);
+            await _context.SaveChangesAsync();
+
+            // 生成 JWT Token
+            var token = GenerateJwtToken(user.Username);
+
+            _logger.LogInformation($"使用者 {user.Username} 註冊成功");
+
+            return Ok(new ApiResponse<LoginResponse>
+            {
+                StatusCode = 200,
+                Success = true,
+                Message = "註冊成功",
+                Data = new LoginResponse
+                {
+                    Success = true,
+                    Token = token,
+                    Message = "註冊成功",
+                    ExpiresAt = DateTime.UtcNow.AddHours(1)
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "註冊過程中發生錯誤");
+            return StatusCode(500, new ApiResponse
+            {
+                StatusCode = 500,
+                Success = false,
+                Message = "伺服器內部錯誤"
+            });
+        }
     }
 
     /// <summary>
@@ -42,16 +137,19 @@ public class AuthController : ControllerBase
     [ProducesResponseType(typeof(ApiResponse), StatusCodes.Status422UnprocessableEntity)]
     [ProducesResponseType(typeof(ApiResponse), StatusCodes.Status401Unauthorized)]
     [ProducesResponseType(typeof(ApiResponse), StatusCodes.Status500InternalServerError)]
-    public IActionResult Login([FromBody] LoginRequest request)
+    public async Task<IActionResult> Login([FromBody] LoginRequest request)
     {
         try
         {
             // 模型驗證由 ValidationErrorFilter 自動處理
 
-            // 驗證用戶憑證（實際應用中應該從資料庫查詢）
-            if (!_users.ContainsKey(request.Username) || _users[request.Username] != request.Password)
+            // 從資料庫查詢使用者
+            var user = await _context.Users
+                .FirstOrDefaultAsync(u => u.Username == request.Username);
+
+            if (user == null)
             {
-                _logger.LogWarning($"登入失敗：使用者名稱 {request.Username}");
+                _logger.LogWarning($"登入失敗：使用者名稱 {request.Username} 不存在");
                 return Unauthorized(new ApiResponse
                 {
                     StatusCode = 401,
@@ -60,10 +158,26 @@ public class AuthController : ControllerBase
                 });
             }
 
-            // 生成 JWT Token
-            var token = GenerateJwtToken(request.Username);
+            // 驗證密碼
+            if (!BCrypt.Net.BCrypt.Verify(request.Password, user.PasswordHash))
+            {
+                _logger.LogWarning($"登入失敗：使用者名稱 {request.Username} 密碼錯誤");
+                return Unauthorized(new ApiResponse
+                {
+                    StatusCode = 401,
+                    Success = false,
+                    Message = "使用者名稱或密碼錯誤"
+                });
+            }
 
-            _logger.LogInformation($"使用者 {request.Username} 登入成功");
+            // 更新最後更新時間
+            user.UpdatedAt = DateTime.UtcNow;
+            await _context.SaveChangesAsync();
+
+            // 生成 JWT Token
+            var token = GenerateJwtToken(user.Username);
+
+            _logger.LogInformation($"使用者 {user.Username} 登入成功");
 
             return Ok(new ApiResponse<LoginResponse>
             {
@@ -104,7 +218,7 @@ public class AuthController : ControllerBase
     [ProducesResponseType(typeof(TokenResponse), StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
     [ProducesResponseType(StatusCodes.Status401Unauthorized)]
-    public IActionResult Token([FromForm] TokenRequest request)
+    public async Task<IActionResult> Token([FromForm] TokenRequest request)
     {
         try
         {
@@ -114,10 +228,20 @@ public class AuthController : ControllerBase
                 return BadRequest(new { error = "unsupported_grant_type", error_description = "只支援 password grant type" });
             }
 
-            // 驗證用戶憑證
-            if (!_users.ContainsKey(request.username) || _users[request.username] != request.password)
+            // 從資料庫查詢使用者
+            var user = await _context.Users
+                .FirstOrDefaultAsync(u => u.Username == request.username);
+
+            if (user == null)
             {
-                _logger.LogWarning($"Token 請求失敗：使用者名稱 {request.username}");
+                _logger.LogWarning($"Token 請求失敗：使用者名稱 {request.username} 不存在");
+                return Unauthorized(new { error = "invalid_grant", error_description = "使用者名稱或密碼錯誤" });
+            }
+
+            // 驗證密碼
+            if (!BCrypt.Net.BCrypt.Verify(request.password, user.PasswordHash))
+            {
+                _logger.LogWarning($"Token 請求失敗：使用者名稱 {request.username} 密碼錯誤");
                 return Unauthorized(new { error = "invalid_grant", error_description = "使用者名稱或密碼錯誤" });
             }
 
